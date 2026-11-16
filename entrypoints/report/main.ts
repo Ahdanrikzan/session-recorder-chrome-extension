@@ -12,6 +12,7 @@
  */
 import { getSession, getEvents, getAssets } from '@/lib/storage';
 import { formatClock } from '@/lib/export/markdown';
+import { buildCurlCommand } from '@/lib/export/curl';
 import {
   applyLevel,
   collapseRepeatedRequests,
@@ -157,6 +158,10 @@ function render(): void {
     settings: session.settings,
   };
   const trimmed = trimForLevel(events, level, ctx);
+  const rawNetById = new Map<string, NetRequestPayload>();
+  for (const ev of events) {
+    if (ev.type === 'net-request') rawNetById.set(ev.id, ev.payload);
+  }
 
   const root = el('div');
 
@@ -196,9 +201,9 @@ function render(): void {
         j += 1;
       }
       if (run.length >= 3) {
-        tl.appendChild(netGroup(run));
+        tl.appendChild(netGroup(run, rawNetById));
       } else {
-        for (const r of run) tl.appendChild(eventNode(r, mediaUrls));
+        for (const r of run) tl.appendChild(eventNode(r, mediaUrls, rawNetById));
       }
       i = j;
     } else if (e.type === 'voice-segment') {
@@ -209,10 +214,10 @@ function render(): void {
         run.push(trimmed[j]! as Extract<SessionEvent, { type: 'voice-segment' }>);
         j += 1;
       }
-      tl.appendChild(run.length >= 2 ? voiceGroup(run) : eventNode(e, mediaUrls));
+      tl.appendChild(run.length >= 2 ? voiceGroup(run) : eventNode(e, mediaUrls, rawNetById));
       i = j;
     } else {
-      tl.appendChild(eventNode(e, mediaUrls));
+      tl.appendChild(eventNode(e, mediaUrls, rawNetById));
       i += 1;
     }
   }
@@ -234,7 +239,7 @@ function clockOf(e: SessionEvent): HTMLElement {
   return el('span', 'r-time', formatClock(e.t));
 }
 
-function eventNode(e: SessionEvent, mediaUrls: Map<string, string>): HTMLElement {
+function eventNode(e: SessionEvent, mediaUrls: Map<string, string>, rawNetById?: Map<string, NetRequestPayload>): HTMLElement {
   const row = el('div', 'r-row');
   switch (e.type) {
     case 'nav':
@@ -281,7 +286,7 @@ function eventNode(e: SessionEvent, mediaUrls: Map<string, string>): HTMLElement
       return row;
     }
     case 'net-request':
-      return netRow(e.payload, e);
+      return netRow(e.payload, e, rawNetById);
     case 'console': {
       const p = e.payload;
       row.className = 'r-row' + (p.level === 'error' ? ' r-err' : ' r-muted');
@@ -338,14 +343,21 @@ function eventNode(e: SessionEvent, mediaUrls: Map<string, string>): HTMLElement
   }
 }
 
-function netRow(p: NetRequestPayload, e: SessionEvent): HTMLElement {
+function netRow(p: NetRequestPayload, e: SessionEvent, rawNetById?: Map<string, NetRequestPayload>): HTMLElement {
   const bad = p.failed || (typeof p.status === 'number' && p.status >= 400);
   const row = el('div', 'r-net' + (bad ? ' r-err' : ''));
   const line = el('div', 'r-netline');
   line.append(clockOf(e), tag('net'));
   line.appendChild(el('span', 'r-net__meth', `${p.method} ${pathOf(p.url)}`));
   const status = p.failed ? 'failed' : netMeta(p.status, p.timing?.durationMs);
-  if (status) line.appendChild(el('span', 'r-net__status', status));
+  const rawPayload = rawNetById?.get(e.id) ?? p;
+  const curl = buildCurlCommand(rawPayload);
+  if (status || curl) {
+    const actions = el('div', 'r-net__actions');
+    if (status) actions.appendChild(el('span', 'r-net__status', status));
+    if (curl) actions.appendChild(copyCurlButton(p, curl));
+    line.appendChild(actions);
+  }
   row.appendChild(line);
   if (p.collapsed) {
     row.appendChild(el('div', 'r-net__note', `(×${p.collapsed.count} similar, statuses ${p.collapsed.statuses.join(', ')})`));
@@ -359,7 +371,44 @@ function netRow(p: NetRequestPayload, e: SessionEvent): HTMLElement {
   return row;
 }
 
-function netGroup(run: SessionEvent[]): HTMLElement {
+function copyCurlButton(p: NetRequestPayload, curl: string): HTMLButtonElement {
+  const btn = el('button', 'r-copy', 'Copy cURL');
+  btn.type = 'button';
+  btn.ariaLabel = `Copy cURL for ${p.method} ${pathOf(p.url)}`;
+  let timer: number | undefined;
+  btn.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    const ok = await copyText(curl);
+    if (!ok) return;
+    btn.textContent = 'Copied';
+    btn.classList.add('r-copy--done');
+    if (timer !== undefined) window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      btn.textContent = 'Copy cURL';
+      btn.classList.remove('r-copy--done');
+    }, 1800);
+  });
+  return btn;
+}
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const copied = document.execCommand('copy');
+    ta.remove();
+    return copied;
+  }
+}
+
+function netGroup(run: SessionEvent[], rawNetById?: Map<string, NetRequestPayload>): HTMLElement {
   const errors = run.filter(
     (e) => e.type === 'net-request' && (e.payload.failed || (typeof e.payload.status === 'number' && e.payload.status >= 400)),
   ).length;
@@ -374,7 +423,7 @@ function netGroup(run: SessionEvent[]): HTMLElement {
   details.appendChild(summary);
   const inner = el('div', 'r-netgroup__list');
   for (const e of run) {
-    if (e.type === 'net-request') inner.appendChild(netRow(e.payload, e));
+    if (e.type === 'net-request') inner.appendChild(netRow(e.payload, e, rawNetById));
   }
   details.appendChild(inner);
   wrap.appendChild(details);
